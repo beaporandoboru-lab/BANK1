@@ -1,0 +1,80 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isSelf(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/accounts/$(request.auth.uid))
+        && get(/databases/$(database)/documents/accounts/$(request.auth.uid)).data.role == 'admin';
+    }
+    function callerBalance() {
+      return get(/databases/$(database)/documents/accounts/$(request.auth.uid)).data.balance;
+    }
+    function callerBalanceAfter() {
+      return getAfter(/databases/$(database)/documents/accounts/$(request.auth.uid)).data.balance;
+    }
+
+    // --- accounts/{uid}: profile + balance for each member (and the special "reserve" account) ---
+    match /accounts/{uid} {
+      allow read: if isSignedIn();
+
+      // Signing up creates your own account doc, always as a regular member with balance 0.
+      allow create: if isSelf(uid)
+        && request.resource.data.role == 'member'
+        && request.resource.data.balance == 0;
+
+      allow update: if isSignedIn() && (
+        // Case 1: you're sending money out of your OWN account (balance can only go down)
+        (isSelf(uid)
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.balance <= resource.data.balance)
+        ||
+        // Case 2: you're crediting SOMEONE ELSE's account, but only if your own account is
+        // simultaneously debited by the exact same amount in this same commit (atomic transfer).
+        // Not allowed to target "reserve" this way — only admins can move the reserve.
+        (!isSelf(uid) && uid != 'reserve'
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.balance > resource.data.balance
+          && callerBalanceAfter() == callerBalance() - (request.resource.data.balance - resource.data.balance))
+        ||
+        // Case 3: admins can adjust any account (issue / confiscate / approve deposit & withdraw requests)
+        isAdmin()
+      );
+
+      allow delete: if false;
+    }
+
+    // --- requests/{id}: deposit/withdraw requests waiting for admin approval ---
+    match /requests/{id} {
+      allow read: if isSignedIn() && (isAdmin() || resource.data.accountUid == request.auth.uid);
+
+      allow create: if isSelf(request.resource.data.accountUid)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.type in ['deposit', 'withdraw'];
+
+      // Admin can only move a request from pending -> approved/rejected, nothing else.
+      allow update: if isAdmin()
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.accountUid == resource.data.accountUid
+        && request.resource.data.amount == resource.data.amount
+        && request.resource.data.type == resource.data.type;
+
+      allow delete: if false;
+    }
+
+    // --- transactions/{id}: append-only public ledger ---
+    match /transactions/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
